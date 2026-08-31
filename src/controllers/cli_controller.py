@@ -8,13 +8,9 @@ from ..utils.formatter import export_aibom
 import os
 import shutil
 
-try:
-    from spdx_tools.spdx.parser.jsonlikedict.json_like_dict_parser import JsonLikeDictParser
-    from spdx_tools.spdx.validation.document_validator import validate_full_spdx_document
-    from spdx_tools.spdx.parser.error import SPDXParsingError
-    SPDX_TOOLS_AVAILABLE = True
-except ImportError:
-    SPDX_TOOLS_AVAILABLE = False
+from spdx_tools.spdx.parser.jsonlikedict.json_like_dict_parser import JsonLikeDictParser
+from spdx_tools.spdx.validation.document_validator import validate_full_spdx_document
+from spdx_tools.spdx.parser.error import SPDXParsingError
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +55,6 @@ class CLIController:
         """
         Validates the AIBOM data using the official spdx-tools package.
         """
-        if not SPDX_TOOLS_AVAILABLE:
-            logger.error("spdx-tools is not installed. Cannot validate SPDX schema.")
-            return False
-
         try:
             # Map aibom versions to spdx_tools expected format e.g. "SPDX-2.3"
             spdx_version_str = f"SPDX-{spec_version}"
