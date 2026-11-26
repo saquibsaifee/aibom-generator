@@ -14,6 +14,15 @@ from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.contact import OrganizationalContact, OrganizationalEntity
 from cyclonedx.model.dependency import Dependency
 from cyclonedx.model.license import DisjunctiveLicense, LicenseExpression
+from cyclonedx.model.model_card import (
+    Considerations,
+    EthicalConsideration,
+    InputOutputMLParameters,
+    ModelCard as CdxModelCard,
+    ModelParameters,
+    PerformanceMetric,
+    QuantitativeAnalysis,
+)
 from cyclonedx.contrib.license.factories import LicenseFactory as _CdxLicenseFactory
 from cyclonedx.output.json import JsonV1Dot6
 
@@ -299,12 +308,17 @@ class AIBOMService:
         )
 
         aibom = json.loads(JsonV1Dot6(bom).output_as_string())
-        # modelCard is injected manually because cyclonedx-python-lib does not yet implement
-        # the Component.model_card property — it is stubbed as "# TODO since CDX1.5" in the
-        # library source (cyclonedx/model/component.py). Once the library adds native support,
-        # this post-serialization dict manipulation should be replaced with a proper object.
-        if component_section.get("modelCard"):
-            aibom["components"][0]["modelCard"] = component_section["modelCard"]
+        # modelParameters.datasets is not yet supported by cyclonedx-python-lib (v11.13.0)
+        # pending https://github.com/CycloneDX/cyclonedx-python-lib/issues/913.
+        # Inject only modelParameters.datasets after serialization until native support lands.
+        datasets = (
+            component_section.get("modelCard", {})
+            .get("modelParameters", {})
+            .get("datasets")
+        )
+        if datasets:
+            model_card_out = aibom["components"][0].setdefault("modelCard", {})
+            model_card_out.setdefault("modelParameters", {})["datasets"] = datasets
         return aibom
 
     def _build_cyclonedx_metadata(self, metadata_section: Dict[str, Any]) -> BomMetaData:
@@ -346,8 +360,115 @@ class AIBOMService:
             supplier=self._entity_from_dict(component_section.get("supplier")),
             authors=self._authors_from_dicts(component_section.get("authors", [])),
             properties=self._properties_from_dicts(component_section.get("properties", [])),
-            external_references=self._external_refs_from_dicts(component_section.get("externalReferences", []))
+            external_references=self._external_refs_from_dicts(component_section.get("externalReferences", [])),
+            model_card=self._model_card_from_dict(component_section.get("modelCard")),
         )
+
+    def _model_card_from_dict(self, model_card: Optional[Dict[str, Any]]) -> Optional[CdxModelCard]:
+        """Convert an internal modelCard dict into a cyclonedx-python-lib ModelCard object."""
+        if not model_card:
+            return None
+
+        # 1. Model Parameters (excluding datasets — not yet supported in cyclonedx-python-lib
+        # v11.13.0, tracked by https://github.com/CycloneDX/cyclonedx-python-lib/issues/913)
+        model_parameters = None
+        params_dict = model_card.get("modelParameters") or {}
+        if params_dict:
+            task = params_dict.get("task")
+            architecture_family = params_dict.get("architectureFamily")
+            model_architecture = params_dict.get("modelArchitecture")
+            inputs = [
+                InputOutputMLParameters(format=str(item["format"]))
+                for item in params_dict.get("inputs", [])
+                if isinstance(item, dict) and item.get("format")
+            ]
+            outputs = [
+                InputOutputMLParameters(format=str(item["format"]))
+                for item in params_dict.get("outputs", [])
+                if isinstance(item, dict) and item.get("format")
+            ]
+            if any([task, architecture_family, model_architecture, inputs, outputs]):
+                model_parameters = ModelParameters(
+                    task=str(task) if task is not None else None,
+                    architecture_family=str(architecture_family) if architecture_family is not None else None,
+                    model_architecture=str(model_architecture) if model_architecture is not None else None,
+                    inputs=inputs,
+                    outputs=outputs,
+                )
+
+        # 2. Quantitative Analysis
+        quantitative_analysis = None
+        quant_dict = model_card.get("quantitativeAnalysis") or {}
+        if quant_dict:
+            metrics = [
+                PerformanceMetric(
+                    type=str(metric["type"]) if metric.get("type") is not None else None,
+                    value=str(metric["value"]) if metric.get("value") is not None else None,
+                    slice_=str(metric["slice"]) if metric.get("slice") is not None else None,
+                )
+                for metric in quant_dict.get("performanceMetrics", [])
+                if isinstance(metric, dict)
+                and (metric.get("type") is not None or metric.get("value") is not None)
+            ]
+            if metrics:
+                quantitative_analysis = QuantitativeAnalysis(performance_metrics=metrics)
+
+        # 3. Considerations
+        considerations = None
+        considerations_dict = model_card.get("considerations") or {}
+        if considerations_dict:
+            users = self._coerce_str_items(considerations_dict.get("users"))
+            use_cases = self._coerce_str_items(considerations_dict.get("useCases"))
+            technical_limitations = self._coerce_str_items(considerations_dict.get("technicalLimitations"))
+            performance_tradeoffs = self._coerce_str_items(considerations_dict.get("performanceTradeoffs"))
+
+            ethical_considerations: List[EthicalConsideration] = []
+            for entry in considerations_dict.get("ethicalConsiderations", []):
+                if not isinstance(entry, dict) or not entry.get("name"):
+                    continue
+                mitigation = entry.get("mitigationStrategy")
+                names = entry["name"] if isinstance(entry["name"], list) else [entry["name"]]
+                for name in names:
+                    if name is not None and str(name).strip():
+                        ethical_considerations.append(
+                            EthicalConsideration(
+                                name=str(name),
+                                mitigation_strategy=str(mitigation) if mitigation is not None else None,
+                            )
+                        )
+
+            if any([users, use_cases, technical_limitations, performance_tradeoffs, ethical_considerations]):
+                considerations = Considerations(
+                    users=users,
+                    use_cases=use_cases,
+                    technical_limitations=technical_limitations,
+                    performance_tradeoffs=performance_tradeoffs,
+                    ethical_considerations=ethical_considerations,
+                )
+
+        # 4. Properties
+        properties = self._properties_from_dicts(model_card.get("properties", []))
+
+        if not any([model_parameters, quantitative_analysis, considerations, properties]):
+            return None
+
+        return CdxModelCard(
+            bom_ref=model_card.get("bom-ref"),
+            model_parameters=model_parameters,
+            quantitative_analysis=quantitative_analysis,
+            considerations=considerations,
+            properties=properties,
+        )
+
+    @staticmethod
+    def _coerce_str_items(values: Optional[List[Any]]) -> List[str]:
+        items: List[str] = []
+        for item in values or []:
+            if isinstance(item, list):
+                items.extend(str(sub) for sub in item if sub is not None and str(sub).strip())
+            elif item is not None and str(item).strip():
+                items.append(str(item))
+        return items
 
     @staticmethod
     def _entity_from_dict(entity: Optional[Dict[str, Any]]) -> Optional[OrganizationalEntity]:

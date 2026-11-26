@@ -154,6 +154,120 @@ class TestService(unittest.TestCase):
             ExternalReferenceType.WEBSITE
         )
 
+    def test_build_cyclonedx_component_populates_native_model_card(self):
+        from cyclonedx.model.model_card import ModelCard as CdxModelCard
+
+        metadata = {
+            "name": "test-model",
+            "commit": "1234567890abcdef",
+            "primaryPurpose": "text-classification",
+            "typeOfModel": "bert",
+            "datasets": ["glue"],
+            "eval_results": [{"metric_type": "accuracy", "metric_value": 0.94}],
+            "intendedUse": "Classify customer support tickets.",
+            "technicalLimitations": "Limited to 512 tokens.",
+            "ethicalConsiderations": "May reflect training-data bias.",
+            "vocab_size": 30522,
+        }
+
+        with patch.object(self.service, "_verify_dataset_exists_on_hf", return_value=True):
+            component_section = self.service._create_component_section("owner/test-model", metadata)
+
+        component = self.service._build_cyclonedx_component(component_section)
+        self.assertIsInstance(component.model_card, CdxModelCard)
+        self.assertIsNotNone(component.model_card.model_parameters)
+        self.assertEqual(component.model_card.model_parameters.task, "text-classification")
+        self.assertEqual(component.model_card.model_parameters.model_architecture, "bert")
+        self.assertEqual([i.format for i in component.model_card.model_parameters.inputs], ["string"])
+        self.assertEqual([o.format for o in component.model_card.model_parameters.outputs], ["string"])
+
+        self.assertIsNotNone(component.model_card.quantitative_analysis)
+        metrics = list(component.model_card.quantitative_analysis.performance_metrics)
+        self.assertEqual(len(metrics), 1)
+        self.assertEqual(metrics[0].type, "accuracy")
+        self.assertEqual(metrics[0].value, "0.94")
+
+        self.assertIsNotNone(component.model_card.considerations)
+        self.assertIn("Classify customer support tickets.", component.model_card.considerations.use_cases)
+        self.assertIn("Limited to 512 tokens.", component.model_card.considerations.technical_limitations)
+        ethical = list(component.model_card.considerations.ethical_considerations)
+        self.assertEqual(len(ethical), 1)
+        self.assertEqual(ethical[0].name, "May reflect training-data bias.")
+
+        prop_map = {p.name: p.value for p in component.model_card.properties}
+        self.assertEqual(prop_map.get("genai:aibom:modelcard:vocabSize"), "30522")
+        self.assertEqual(prop_map.get("genai:aibom:trainingDataAvailable"), "true")
+
+    def test_create_aibom_structure_serializes_model_card_and_datasets_valid_schema(self):
+        from src.utils.validation import validate_aibom
+
+        metadata = {
+            "name": "test-model",
+            "author": "tester",
+            "commit": "1234567890abcdef",
+            "primaryPurpose": "text-classification",
+            "typeOfModel": "bert",
+            "datasets": ["squad", "glue"],
+            "eval_results": [{"metric_type": "f1", "metric_value": "0.91"}],
+            "intendedUse": "Sentiment classification",
+            "technicalLimitations": "English only",
+            "ethicalConsiderations": "May reflect training-data bias.",
+            "vocab_size": 30522,
+        }
+
+        with patch.object(self.service, "_verify_dataset_exists_on_hf", return_value=True):
+            aibom = self.service._create_aibom_structure("owner/test-model", metadata)
+
+        model_card = aibom["components"][0]["modelCard"]
+        params = model_card["modelParameters"]
+        self.assertEqual(params["task"], "text-classification")
+        self.assertEqual(params["modelArchitecture"], "bert")
+        self.assertEqual(params["inputs"], [{"format": "string"}])
+        self.assertEqual(params["outputs"], [{"format": "string"}])
+        self.assertEqual(
+            [d["name"] for d in params["datasets"]],
+            ["squad", "glue"],
+        )
+        self.assertEqual(
+            model_card["quantitativeAnalysis"]["performanceMetrics"],
+            [{"type": "f1", "value": "0.91"}],
+        )
+        self.assertEqual(model_card["considerations"]["useCases"], ["Sentiment classification"])
+        self.assertEqual(model_card["considerations"]["technicalLimitations"], ["English only"])
+        self.assertEqual(
+            model_card["considerations"]["ethicalConsiderations"],
+            [{"name": "May reflect training-data bias."}],
+        )
+
+        is_valid, errors = validate_aibom(aibom)
+        self.assertTrue(is_valid, f"Schema validation errors: {errors}")
+
+    def test_model_card_from_dict_empty_and_datasets_only(self):
+        self.assertIsNone(self.service._model_card_from_dict(None))
+        self.assertIsNone(self.service._model_card_from_dict({}))
+        # Datasets-only dict must not raise NotImplementedError from cyclonedx-python-lib
+        self.assertIsNone(
+            self.service._model_card_from_dict(
+                {"modelParameters": {"datasets": [{"type": "dataset", "name": "ds"}]}}
+            )
+        )
+
+    def test_model_card_from_dict_flattens_nested_consideration_lists(self):
+        cdx_card = self.service._model_card_from_dict(
+            {
+                "considerations": {
+                    "technicalLimitations": [["limit a", "limit b"]],
+                    "useCases": ["use case 1"],
+                }
+            }
+        )
+        self.assertIsNotNone(cdx_card)
+        self.assertEqual(
+            list(cdx_card.considerations.technical_limitations),
+            ["limit a", "limit b"],
+        )
+        self.assertEqual(list(cdx_card.considerations.use_cases), ["use case 1"])
+
 
 class TestProcessLicenses(unittest.TestCase):
     def setUp(self):
